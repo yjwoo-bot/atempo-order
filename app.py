@@ -16,15 +16,9 @@ ID_TEMPLATE = "1ckbQu1TTQ8F_SdNutgKBUQl3fGo9yM75"
 def get_drive_url(file_id):
     return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
 
-# --- [설정 2] 유통점 정보 ---
-SHOP_DB = {
-    "르위켄": {"code": "103-86-00394", "name": "포지티브라이프컴퍼니(주)", "manager": "최현석", "prefix": "르위켄_"},
-    "피쏘": {"code": "857-81-02121", "name": "주식회사 피쏘", "manager": "송진영", "prefix": "피쏘_"},
-    "옐로우라이트": {"code": "845-86-01861", "name": "(주)옐로우라이트", "manager": "송진영", "prefix": "옐로우라이트_"},
-    "까사디자인": {"code": "117-12-31221", "name": "까사디자인", "manager": "송진영", "prefix": "까사디자인_"}
-}
+# --- [설정 2] 유통점 정보 (르위켄 고정) ---
+INFO = {"code": "103-86-00394", "name": "포지티브라이프컴퍼니(주)", "manager": "최현석", "prefix": "르위켄_"}
 
-# [강제 매핑 규칙]
 STRICT_MAPPING = {
     "CANYON": "H_F212AK101", "UMBER": "H_F212ATL21A", "GRAPHITE": "H_F212ATL22C",
     "LOTUS": "H_F212GK281", "로투스": "H_F212GK281", "CHARCOAL": "H_F212ATL22C",
@@ -35,10 +29,7 @@ STRICT_MAPPING = {
 
 def clean_text(text):
     if not text or pd.isna(text): return ""
-    text = str(text).upper().replace(" ", "") # 공백 제거 후 비교
-    text = re.sub(r'\(.*?\)', '', text)
-    text = re.sub(r'\[.*?\]', '', text)
-    return text.strip()
+    return str(text).upper().replace(" ", "").strip()
 
 def transform_engine(order_file, code_ref, price_ref, temp_cols):
     results = []
@@ -47,98 +38,88 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
     master_by_code = {str(r['품목코드']).strip(): {"name": str(r['품목명']), "price": int(r['소비자가']) if pd.notna(r['소비자가']) else 0} for _, r in price_ref.iterrows()}
     set_standard = [str(n).upper() for n in code_ref['상품명'].dropna().unique()]
 
+    # 시트가 하나이므로 바로 해당 시트 로드 (시트명이 '르위켄'이 아닐 경우 대비해 첫 번째 시트 선택)
     xls = pd.ExcelFile(order_file)
-    order_cnt = 1
-
-    for sheet in xls.sheet_names:
-        df = pd.read_excel(order_file, sheet_name=sheet)
-        if df.empty: continue
-        
-        # 컬럼명에서 공백 제거하여 매칭 확률 높임
-        df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
-        
-        # 시트명 분석 (기본값: 르위켄)
-        clean_sheet = sheet.replace(" ", "").upper()
-        target_key = "르위켄" 
-        for key in SHOP_DB.keys():
-            if key in clean_sheet:
-                target_key = key; break
-        info = SHOP_DB[target_key]
-        
-        # 필수 컬럼 탐색 (유연하게)
-        col_item = next((c for c in df.columns if any(k in c for k in ["상품", "구매제품", "모델", "ITEM"])), None)
-        col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
-        col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
-        col_phone = next((c for c in df.columns if any(k in c for k in ["전화", "연락처", "휴대폰"])), None)
-        col_qty = next((c for c in df.columns if any(k in c for k in ["수량", "QTY"])), None)
-
-        if not col_item: continue
-
-        for _, row in df[df[col_item].notna()].iterrows():
-            raw_full_name = str(row[col_item])
-            if "취소함" in raw_full_name or raw_full_name.strip() == "": continue
+    target_sheet = xls.sheet_names[0] 
+    
+    # 헤더 위치 자동 찾기 로직 강화
+    df_raw = pd.read_excel(order_file, sheet_name=target_sheet, header=None)
+    header_idx = 0
+    for i, row in df_raw.iterrows():
+        if any(k in str(s) for s in row.values for k in ["구매", "상품", "ITEM", "제품"]):
+            header_idx = i
+            break
             
-            clean_name = clean_text(raw_full_name)
-            if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): continue
+    df = pd.read_excel(order_file, sheet_name=target_sheet, skiprows=header_idx)
+    df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
 
-            # 고객명에서 업체 접두어 중복 방지
-            raw_cust = str(row.get(col_cust, '')).strip()
-            clean_cust = re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)
-            customer_name = f"{info['prefix']}{clean_cust}"
-            
-            box_codes = []
-            final_n = ""
-            
-            # 1. 톨로메오 메가 등 특정 세트
-            if "MEGA" in clean_name and "42" in clean_name:
-                final_n = "TOLOMEO MEGA FLOOR PARCHMENT 420"
-                set_rows = code_ref[code_ref['상품명'].str.contains("MEGA", na=False) & code_ref['상품명'].str.contains("420", na=False)]
+    # 컬럼 매핑
+    col_item = next((c for c in df.columns if any(k in c for k in ["구매제품", "상품", "모델", "ITEM"])), None)
+    col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
+    col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
+    col_phone = next((c for c in df.columns if any(k in c for k in ["전화", "연락처", "휴대폰"])), None)
+    col_qty = next((c for c in df.columns if any(k in c for k in ["수량", "QTY"])), None)
+
+    if not col_item:
+        return pd.DataFrame(columns=temp_cols)
+
+    for _, row in df.iterrows():
+        val_item = str(row.get(col_item, ""))
+        if val_item == "nan" or not val_item.strip() or "취소함" in val_item: continue
+        
+        # 기본 클리닝
+        clean_name = clean_text(val_item)
+        if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): continue
+
+        # 고객명 정리
+        raw_cust = str(row.get(col_cust, '')).strip()
+        customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
+        
+        box_codes = []
+        final_n = ""
+        
+        # 1. 강제 매핑 체크
+        for kw, f_code in STRICT_MAPPING.items():
+            if kw.replace(" ","") in clean_name:
+                box_codes = [f_code]
+                final_n = master_by_code.get(f_code, {}).get('name', val_item)
+                break
+        
+        # 2. 유사도 매칭
+        if not box_codes:
+            match = process.extractOne(val_item.upper(), set_standard, scorer=fuzz.token_set_ratio)
+            if match and match[1] > 60: 
+                final_n = match[0]
+                set_rows = code_ref[code_ref['상품명'] == final_n]
                 if not set_rows.empty:
                     box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:] if pd.notna(v) and str(v).strip() != ""]
-            
-            # 2. 강제 매핑
-            if not box_codes:
-                for kw, f_code in STRICT_MAPPING.items():
-                    if kw.replace(" ","") in clean_name:
-                        box_codes = [f_code]
-                        final_n = master_by_code.get(f_code, {}).get('name', raw_full_name)
-                        break
-            
-            # 3. 퍼지 매칭 (유사도 기준 완화)
-            if not box_codes:
-                match = process.extractOne(raw_full_name.upper(), set_standard, scorer=fuzz.token_set_ratio)
-                if match and match[1] > 60: 
-                    final_n = match[0]
-                    set_rows = code_ref[code_ref['상품명'] == final_n]
-                    if not set_rows.empty:
-                        box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:] if pd.notna(v) and str(v).strip() != ""]
 
-            if box_codes:
-                for code in box_codes:
-                    it = master_by_code.get(code)
-                    p_name, p_price = (it['name'], it['price']) if it else (final_n, 0)
-                    mult = 0.8 if "PARENTESI" in p_name.upper() else 0.7
-                    u_price = int(round(p_price * mult))
-                    
-                    try:
-                        qty_val = re.sub(r'[^0-9.]', '', str(row.get(col_qty, 1)))
-                        qty = int(float(qty_val)) if qty_val else 1
-                    except: qty = 1
-                    
-                    res = {c: "" for c in temp_cols}
-                    res.update({
-                        "입력일자": TODAY, "순번": order_cnt, "유통구분": "3", "거래처코드": info["code"],
-                        "거래처명": info["name"], "담당자": info["manager"], "출하창고": "100",
-                        "배송주소": str(row.get(col_addr, '')), "고객명": customer_name, "연락처": str(row.get(col_phone, '')),
-                        "품목코드": code, "품목명": p_name, "수량": qty, "권장소비자가": p_price,
-                        "단가(vat포함)": u_price, "합계액": qty * u_price
-                    })
-                    results.append(res)
-                order_cnt += 1
-            else:
+        if box_codes:
+            for code in box_codes:
+                it = master_by_code.get(code)
+                p_name, p_price = (it['name'], it['price']) if it else (final_n, 0)
+                mult = 0.8 if "PARENTESI" in p_name.upper() else 0.7
+                u_price = int(round(p_price * mult))
+                
+                try:
+                    qty_str = re.sub(r'[^0-9.]', '', str(row.get(col_qty, 1)))
+                    qty = int(float(qty_str)) if qty_str else 1
+                except: qty = 1
+                
                 res = {c: "" for c in temp_cols}
-                res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": raw_full_name, "적요": "ERROR: 미매칭 품목"})
-                results.append(res); order_cnt += 1
+                res.update({
+                    "입력일자": TODAY, "순번": order_cnt, "유통구분": "3", "거래처코드": INFO["code"],
+                    "거래처명": INFO["name"], "담당자": INFO["manager"], "출하창고": "100",
+                    "배송주소": str(row.get(col_addr, '')), "고객명": customer_name, "연락처": str(row.get(col_phone, '')),
+                    "품목코드": code, "품목명": p_name, "수량": qty, "권장소비자가": p_price,
+                    "단가(vat포함)": u_price, "합계액": qty * u_price
+                })
+                results.append(res)
+            order_cnt += 1
+        else:
+            res = {c: "" for c in temp_cols}
+            res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": val_item, "적요": "미매칭"})
+            results.append(res); order_cnt += 1
 
     return pd.DataFrame(results)
 
@@ -154,10 +135,10 @@ if 'masters' not in st.session_state:
             temp_df = pd.read_excel(get_drive_url(ID_TEMPLATE))
             st.session_state.masters = (code_ref, price_ref, temp_df)
             st.sidebar.success("✅ 기준 데이터 연결 완료")
-    except:
-        st.sidebar.error("❌ 드라이브 연결 실패")
+    except Exception as e:
+        st.sidebar.error(f"❌ 드라이브 연결 실패: {e}")
 
-uploaded_file = st.file_uploader("📥 통합 발주리스트 파일을 업로드하세요", type="xlsx")
+uploaded_file = st.file_uploader("📥 '르위켄' 단일 시트 파일을 업로드하세요", type="xlsx")
 
 if uploaded_file and st.button("🪄 ERP 양식으로 변환하기"):
     if 'masters' in st.session_state:
