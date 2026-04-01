@@ -16,8 +16,8 @@ ID_TEMPLATE = "1ckbQu1TTQ8F_SdNutgKBUQl3fGo9yM75"
 def get_drive_url(file_id):
     return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
 
-# --- [설정 2] 유통점 정보 (르위켄 고정) ---
-INFO = {"code": "103-86-00394", "name": "포지티브라이프컴퍼니(주)", "manager": "최현석", "prefix": "르위켄_"}
+# --- [설정 2] 유통점 정보 (기본값: 르위켄) ---
+DEFAULT_INFO = {"code": "103-86-00394", "name": "포지티브라이프컴퍼니(주)", "manager": "최현석", "prefix": "르위켄_"}
 
 STRICT_MAPPING = {
     "CANYON": "H_F212AK101", "UMBER": "H_F212ATL21A", "GRAPHITE": "H_F212ATL22C",
@@ -39,95 +39,98 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
     set_standard = [str(n).upper() for n in code_ref['상품명'].dropna().unique()]
 
     xls = pd.ExcelFile(order_file)
-    target_sheet = xls.sheet_names[0] 
-    
-    df_raw = pd.read_excel(order_file, sheet_name=target_sheet, header=None)
-    header_idx = 0
-    for i, row in df_raw.iterrows():
-        if any(k in str(s) for s in row.values for k in ["구매", "상품", "ITEM", "제품"]):
-            header_idx = i
-            break
-            
-    df = pd.read_excel(order_file, sheet_name=target_sheet, skiprows=header_idx)
-    df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
+    order_cnt = 1
 
-    col_item = next((c for c in df.columns if any(k in c for k in ["구매제품", "상품", "모델", "ITEM"])), None)
-    col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
-    col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
-    col_phone = next((c for c in df.columns if any(k in c for k in ["전화", "연락처", "휴대폰"])), None)
-    col_qty = next((c for c in df.columns if any(k in c for k in ["수량", "QTY"])), None)
+    # 1. 파일 안의 모든 시트를 순회 (필터링 없음)
+    for sheet in xls.sheet_names:
+        df_raw = pd.read_excel(order_file, sheet_name=sheet, header=None)
+        if df_raw.empty: continue
 
-    if not col_item:
-        return pd.DataFrame(columns=temp_cols)
-
-    for _, row in df.iterrows():
-        # --- [해결책] 1. 변수를 미리 빈 값으로 선언해둡니다 (UnboundLocalError 방어) ---
-        customer_name = "미기재"
-        val_item = str(row.get(col_item, ""))
-        
-        # 2. 행이 비어있으면 통과
-        if val_item == "nan" or not val_item.strip(): continue
-        
-        # 3. 고객명을 정의 (데이터가 있을 경우에만 업데이트)
-        raw_cust = str(row.get(col_cust, '')).strip()
-        if raw_cust != "nan" and raw_cust != "":
-            customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
-        
-        # 4. 취소나 배송비 항목 필터링
-        if "취소함" in val_item: continue
-        clean_name = clean_text(val_item)
-        if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): continue
-
-        box_codes = []
-        final_n = ""
-        
-        # 매칭 로직
-        for kw, f_code in STRICT_MAPPING.items():
-            if kw.replace(" ","") in clean_name:
-                box_codes = [f_code]
-                final_n = master_by_code.get(f_code, {}).get('name', val_item)
+        # 2. 헤더(컬럼명) 위치 자동 찾기
+        header_idx = 0
+        for i, row in df_raw.iterrows():
+            if any(k in str(s) for s in row.values for k in ["구매", "상품", "ITEM", "제품"]):
+                header_idx = i
                 break
         
-        if not box_codes:
-            match = process.extractOne(val_item.upper(), set_standard, scorer=fuzz.token_set_ratio)
-            if match and match[1] > 60: 
-                final_n = match[0]
-                set_rows = code_ref[code_ref['상품명'] == final_n]
-                if not set_rows.empty:
-                    box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:] if pd.notna(v) and str(v).strip() != ""]
+        df = pd.read_excel(order_file, sheet_name=sheet, skiprows=header_idx)
+        df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
 
-        if box_codes:
-            for code in box_codes:
-                it = master_by_code.get(code)
-                p_name, p_price = (it['name'], it['price']) if it else (final_n, 0)
-                mult = 0.8 if "PARENTESI" in p_name.upper() else 0.7
-                u_price = int(round(p_price * mult))
-                
-                try:
-                    qty_str = re.sub(r'[^0-9.]', '', str(row.get(col_qty, 1)))
-                    qty = int(float(qty_str)) if qty_str and qty_str != '.' else 1
-                except: qty = 1
-                
+        # 3. 필수 컬럼 매핑
+        col_item = next((c for c in df.columns if any(k in c for k in ["상품", "구매제품", "모델", "ITEM"])), None)
+        col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
+        col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
+        col_phone = next((c for c in df.columns if any(k in c for k in ["전화", "연락처", "휴대폰"])), None)
+        col_qty = next((c for c in df.columns if any(k in c for k in ["수량", "QTY"])), None)
+
+        if not col_item: continue
+
+        # 4. 행 데이터 처리
+        for _, row in df.iterrows():
+            # 변수 초기화 (UnboundLocalError 방지)
+            customer_name = "미기재"
+            val_item = str(row.get(col_item, ""))
+            
+            if val_item == "nan" or not val_item.strip() or "취소함" in val_item:
+                continue
+
+            # 고객명 추출
+            raw_cust = str(row.get(col_cust, '')).strip()
+            if raw_cust != "nan" and raw_cust != "":
+                customer_name = f"{DEFAULT_INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
+
+            clean_name = clean_text(val_item)
+            if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): 
+                continue
+
+            box_codes = []
+            final_n = ""
+
+            # 5. 매칭 로직
+            for kw, f_code in STRICT_MAPPING.items():
+                if kw.replace(" ","") in clean_name:
+                    box_codes = [f_code]
+                    final_n = master_by_code.get(f_code, {}).get('name', val_item)
+                    break
+            
+            if not box_codes:
+                match = process.extractOne(val_item.upper(), set_standard, scorer=fuzz.token_set_ratio)
+                if match and match[1] > 60:
+                    final_n = match[0]
+                    set_rows = code_ref[code_ref['상품명'] == final_n]
+                    if not set_rows.empty:
+                        box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:] if pd.notna(v) and str(v).strip() != ""]
+
+            # 6. 결과 리스트 적재
+            if box_codes:
+                for code in box_codes:
+                    it = master_by_code.get(code)
+                    p_name, p_price = (it['name'], it['price']) if it else (final_n, 0)
+                    mult = 0.8 if "PARENTESI" in p_name.upper() else 0.7
+                    u_price = int(round(p_price * mult))
+                    try:
+                        qty_val = re.sub(r'[^0-9.]', '', str(row.get(col_qty, 1)))
+                        qty = int(float(qty_val)) if qty_val and qty_val != '.' else 1
+                    except: qty = 1
+                    
+                    res = {c: "" for c in temp_cols}
+                    res.update({
+                        "입력일자": TODAY, "순번": order_cnt, "유통구분": "3", "거래처코드": DEFAULT_INFO["code"],
+                        "거래처명": DEFAULT_INFO["name"], "담당자": DEFAULT_INFO["manager"], "출하창고": "100",
+                        "배송주소": str(row.get(col_addr, '')), "고객명": customer_name, "연락처": str(row.get(col_phone, '')),
+                        "품목코드": code, "품목명": p_name, "수량": qty, "권장소비자가": p_price,
+                        "단가(vat포함)": u_price, "합계액": qty * u_price
+                    })
+                    results.append(res)
+                order_cnt += 1
+            else:
                 res = {c: "" for c in temp_cols}
-                res.update({
-                    "입력일자": TODAY, "순번": order_cnt, "유통구분": "3", "거래처코드": INFO["code"],
-                    "거래처명": INFO["name"], "담당자": INFO["manager"], "출하창고": "100",
-                    "배송주소": str(row.get(col_addr, '')), "고객명": customer_name, "연락처": str(row.get(col_phone, '')),
-                    "품목코드": code, "품목명": p_name, "수량": qty, "권장소비자가": p_price,
-                    "단가(vat포함)": u_price, "합계액": qty * u_price
-                })
-                results.append(res)
-            order_cnt += 1
-        else:
-            # [수정됨] 이제 customer_name이 무조건 존재하므로 121번 라인 에러가 안 납니다.
-            res = {c: "" for c in temp_cols}
-            res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": val_item, "적요": "미매칭"})
-            results.append(res)
-            order_cnt += 1
+                res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": val_item, "적요": "미매칭"})
+                results.append(res); order_cnt += 1
 
     return pd.DataFrame(results)
 
-# --- UI (전체 코드 유지) ---
+# --- UI ---
 st.set_page_config(page_title="atempo 유통점 발주 ERP 변환 시스템", layout="wide")
 st.title("🤖 atempo 유통점 발주 ERP 변환 시스템")
 
@@ -142,13 +145,13 @@ if 'masters' not in st.session_state:
     except Exception as e:
         st.sidebar.error(f"❌ 드라이브 연결 실패")
 
-uploaded_file = st.file_uploader("📥 파일을 업로드하세요", type="xlsx")
+uploaded_file = st.file_uploader("📥 엑셀 파일을 업로드하세요 (모든 시트를 읽습니다)", type="xlsx")
 
 if uploaded_file and st.button("🪄 ERP 양식으로 변환하기"):
     if 'masters' in st.session_state:
         m_code, m_price, m_temp = st.session_state.masters
         final_df = transform_engine(uploaded_file, m_code, m_price, m_temp.columns.tolist())
-        st.success(f"변환 완료! (총 {len(final_df)}행)")
+        st.success(f"변환 완료! (총 {len(final_df)}행 추출)")
         st.dataframe(final_df)
         
         output = io.BytesIO()
