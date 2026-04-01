@@ -8,7 +8,7 @@ from rapidfuzz import process, fuzz
 
 warnings.filterwarnings("ignore")
 
-# --- [설정 1] 구글 드라이브 파일 ID (고정) ---
+# --- [설정 1] 구글 드라이브 파일 ID ---
 ID_PRICE_REF = "1yyTzZapuX9qTwwfcOjEtRVBfn5QaKPDz"
 ID_CODE_REF = "1IIYU0JtaBed7ELoB6ASj3bcoewbNRhk8"
 ID_TEMPLATE = "1ckbQu1TTQ8F_SdNutgKBUQl3fGo9yM75"
@@ -28,22 +28,25 @@ STRICT_MAPPING = {
 }
 
 def super_clean(text):
-    """글자에서 공백, 괄호, 특수문자를 싹 제거하여 비교용 뼈대만 남김"""
+    """비교를 방해하는 요소를 제거하여 순수 키워드만 남김"""
     if not text or pd.isna(text): return ""
     text = str(text).upper()
-    text = re.sub(r'\(.*?\)', '', text) # 괄호 내용 삭제
-    text = re.sub(r'[^A-Z0-9가-힣]', '', text) # 영문, 숫자, 한글 제외 모두 삭제
+    # 괄호와 그 안의 내용 삭제 (예: (ALU), [정품] 등)
+    text = re.sub(r'\(.*?\)|\[.*?\]', '', text)
+    # 특수문자와 공백 완전 제거
+    text = re.sub(r'[^A-Z0-9가-힣]', '', text)
     return text.strip()
 
 def transform_engine(order_file, code_ref, price_ref, temp_cols):
     results = []
     TODAY = datetime.now().strftime('%Y-%m-%d')
     
+    # 단가 마스터 정리
     master_by_code = {str(r['품목코드']).strip(): {"name": str(r['품목명']), "price": int(r['소비자가']) if pd.notna(r['소비자가']) else 0} for _, r in price_ref.iterrows()}
     
-    # 기준 데이터 전처리 (비교용)
+    # 기준 데이터 전처리
     code_ref['clean_name'] = code_ref['상품명'].apply(super_clean)
-    set_standard = code_ref[['상품명', 'clean_name']].dropna()
+    set_standard = code_ref.dropna(subset=['상품명'])
 
     xls = pd.ExcelFile(order_file)
     order_cnt = 1
@@ -52,6 +55,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         df_raw = pd.read_excel(order_file, sheet_name=sheet, header=None)
         if df_raw.empty: continue
 
+        # 헤더 자동 찾기
         header_idx = 0
         for i, row in df_raw.iterrows():
             if any(k in str(s) for s in row.values for k in ["구매", "상품", "ITEM", "제품"]):
@@ -72,7 +76,6 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         for _, row in df.iterrows():
             customer_name = "미기재"
             val_item = str(row.get(col_item, ""))
-            
             if val_item == "nan" or not val_item.strip(): continue
             
             raw_cust = str(row.get(col_cust, '')).strip()
@@ -81,29 +84,29 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
             
             if "취소함" in val_item: continue
             
-            # 비교용 클리닝
+            # 비교용 데이터 생성
             item_for_match = super_clean(val_item)
             if any(x in item_for_match for x in ["시공비", "발송건", "배송비", "배송료"]): continue
 
             box_codes = []
             final_n = ""
 
-            # 1. 강제 매핑
+            # 1. 강제 매핑 우선 적용
             for kw, f_code in STRICT_MAPPING.items():
                 if super_clean(kw) in item_for_match:
                     box_codes = [f_code]
                     final_n = master_by_code.get(f_code, {}).get('name', val_item)
                     break
             
-            # 2. 고도화된 퍼지 매칭
+            # 2. 퍼지 매칭 강화
             if not box_codes:
-                # 유사도 검사 (token_set_ratio 사용으로 단어 순서 바뀌어도 인식)
-                match = process.extractOne(item_for_match, set_standard['clean_name'], scorer=fuzz.token_set_ratio)
-                if match and match[1] > 75: 
-                    final_n = set_standard.iloc[match[2]]['상품명']
-                    set_rows = code_ref[code_ref['상품명'] == final_n]
-                    if not set_rows.empty:
-                        box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:6] if pd.notna(v) and str(v).strip() != ""]
+                match = process.extractOne(item_for_match, set_standard['clean_name'], scorer=fuzz.token_sort_ratio)
+                if match and match[1] > 70: 
+                    row_idx = match[2]
+                    final_n = set_standard.iloc[row_idx]['상품명']
+                    # [핵심 수정] 2열부터 끝까지 데이터가 있는 모든 품목코드를 다 가져옴
+                    target_row = set_standard.iloc[row_idx]
+                    box_codes = [str(v).strip() for v in target_row[1:-1] if pd.notna(v) and str(v).strip() != ""]
 
             if box_codes:
                 for code in box_codes:
@@ -145,7 +148,7 @@ if 'masters' not in st.session_state:
             temp_df = pd.read_excel(get_drive_url(ID_TEMPLATE))
             st.session_state.masters = (code_ref, price_ref, temp_df)
             st.sidebar.success("✅ 기준 데이터 연결 완료")
-    except Exception as e:
+    except:
         st.sidebar.error("❌ 드라이브 연결 실패")
 
 uploaded_file = st.file_uploader("📥 파일을 업로드하세요", type="xlsx")
