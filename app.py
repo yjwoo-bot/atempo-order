@@ -61,16 +61,19 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         return pd.DataFrame(columns=temp_cols)
 
     for _, row in df.iterrows():
+        # --- [해결책] 1. 변수를 미리 빈 값으로 선언해둡니다 (UnboundLocalError 방어) ---
+        customer_name = "미기재"
         val_item = str(row.get(col_item, ""))
-        # 1. 아예 빈 행은 그냥 통과
+        
+        # 2. 행이 비어있으면 통과
         if val_item == "nan" or not val_item.strip(): continue
         
-        # 2. [핵심] 고객명을 가장 먼저 정의 (어떤 상황에서도 변수가 존재하게 함)
+        # 3. 고객명을 정의 (데이터가 있을 경우에만 업데이트)
         raw_cust = str(row.get(col_cust, '')).strip()
-        if raw_cust == "nan": raw_cust = "미기재"
-        customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
+        if raw_cust != "nan" and raw_cust != "":
+            customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
         
-        # 3. 취소나 배송비 항목은 여기서 걸러냄 (이제 customer_name이 정의된 상태라 안전)
+        # 4. 취소나 배송비 항목 필터링
         if "취소함" in val_item: continue
         clean_name = clean_text(val_item)
         if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): continue
@@ -78,7 +81,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         box_codes = []
         final_n = ""
         
-        # 매칭 로직 시작
+        # 매칭 로직
         for kw, f_code in STRICT_MAPPING.items():
             if kw.replace(" ","") in clean_name:
                 box_codes = [f_code]
@@ -116,7 +119,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
                 results.append(res)
             order_cnt += 1
         else:
-            # 매칭 실패 시 (이제 customer_name 에러 안 남)
+            # [수정됨] 이제 customer_name이 무조건 존재하므로 121번 라인 에러가 안 납니다.
             res = {c: "" for c in temp_cols}
             res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": val_item, "적요": "미매칭"})
             results.append(res)
@@ -124,7 +127,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
 
     return pd.DataFrame(results)
 
-# --- UI (생략 없이 전체) ---
+# --- UI (전체 코드 유지) ---
 st.set_page_config(page_title="atempo 유통점 발주 ERP 변환 시스템", layout="wide")
 st.title("🤖 atempo 유통점 발주 ERP 변환 시스템")
 
