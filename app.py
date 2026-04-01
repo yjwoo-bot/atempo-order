@@ -38,11 +38,9 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
     master_by_code = {str(r['품목코드']).strip(): {"name": str(r['품목명']), "price": int(r['소비자가']) if pd.notna(r['소비자가']) else 0} for _, r in price_ref.iterrows()}
     set_standard = [str(n).upper() for n in code_ref['상품명'].dropna().unique()]
 
-    # 시트가 하나이므로 바로 해당 시트 로드 (시트명이 '르위켄'이 아닐 경우 대비해 첫 번째 시트 선택)
     xls = pd.ExcelFile(order_file)
     target_sheet = xls.sheet_names[0] 
     
-    # 헤더 위치 자동 찾기 로직 강화
     df_raw = pd.read_excel(order_file, sheet_name=target_sheet, header=None)
     header_idx = 0
     for i, row in df_raw.iterrows():
@@ -53,7 +51,6 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
     df = pd.read_excel(order_file, sheet_name=target_sheet, skiprows=header_idx)
     df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
 
-    # 컬럼 매핑
     col_item = next((c for c in df.columns if any(k in c for k in ["구매제품", "상품", "모델", "ITEM"])), None)
     col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
     col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
@@ -67,25 +64,23 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         val_item = str(row.get(col_item, ""))
         if val_item == "nan" or not val_item.strip() or "취소함" in val_item: continue
         
-        # 기본 클리닝
+        # [수정] 에러 방지를 위해 고객명을 품목 체크보다 먼저 정의합니다.
+        raw_cust = str(row.get(col_cust, '')).strip()
+        if raw_cust == "nan": raw_cust = ""
+        customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
+        
         clean_name = clean_text(val_item)
         if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): continue
 
-        # 고객명 정리
-        raw_cust = str(row.get(col_cust, '')).strip()
-        customer_name = f"{INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
-        
         box_codes = []
         final_n = ""
         
-        # 1. 강제 매핑 체크
         for kw, f_code in STRICT_MAPPING.items():
             if kw.replace(" ","") in clean_name:
                 box_codes = [f_code]
                 final_n = master_by_code.get(f_code, {}).get('name', val_item)
                 break
         
-        # 2. 유사도 매칭
         if not box_codes:
             match = process.extractOne(val_item.upper(), set_standard, scorer=fuzz.token_set_ratio)
             if match and match[1] > 60: 
@@ -103,7 +98,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
                 
                 try:
                     qty_str = re.sub(r'[^0-9.]', '', str(row.get(col_qty, 1)))
-                    qty = int(float(qty_str)) if qty_str else 1
+                    qty = int(float(qty_str)) if qty_str and qty_str != '.' else 1
                 except: qty = 1
                 
                 res = {c: "" for c in temp_cols}
@@ -119,11 +114,12 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         else:
             res = {c: "" for c in temp_cols}
             res.update({"입력일자": TODAY, "순번": order_cnt, "고객명": customer_name, "품목명": val_item, "적요": "미매칭"})
-            results.append(res); order_cnt += 1
+            results.append(res)
+            order_cnt += 1
 
     return pd.DataFrame(results)
 
-# --- UI (동일) ---
+# --- UI 부분 ---
 st.set_page_config(page_title="atempo 유통점 발주 ERP 변환 시스템", layout="wide")
 st.title("🤖 atempo 유통점 발주 ERP 변환 시스템")
 
@@ -136,15 +132,15 @@ if 'masters' not in st.session_state:
             st.session_state.masters = (code_ref, price_ref, temp_df)
             st.sidebar.success("✅ 기준 데이터 연결 완료")
     except Exception as e:
-        st.sidebar.error(f"❌ 드라이브 연결 실패: {e}")
+        st.sidebar.error(f"❌ 드라이브 연결 실패")
 
-uploaded_file = st.file_uploader("📥 '르위켄' 단일 시트 파일을 업로드하세요", type="xlsx")
+uploaded_file = st.file_uploader("📥 파일을 업로드하세요", type="xlsx")
 
 if uploaded_file and st.button("🪄 ERP 양식으로 변환하기"):
     if 'masters' in st.session_state:
         m_code, m_price, m_temp = st.session_state.masters
         final_df = transform_engine(uploaded_file, m_code, m_price, m_temp.columns.tolist())
-        st.success(f"변환 완료! 총 {len(final_df)}행을 추출했습니다.")
+        st.success(f"변환 완료! (총 {len(final_df)}행)")
         st.dataframe(final_df)
         
         output = io.BytesIO()
