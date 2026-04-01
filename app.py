@@ -16,7 +16,7 @@ ID_TEMPLATE = "1ckbQu1TTQ8F_SdNutgKBUQl3fGo9yM75"
 def get_drive_url(file_id):
     return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
 
-# --- [설정 2] 유통점 정보 (기본값: 르위켄) ---
+# --- [설정 2] 유통점 정보 ---
 DEFAULT_INFO = {"code": "103-86-00394", "name": "포지티브라이프컴퍼니(주)", "manager": "최현석", "prefix": "르위켄_"}
 
 STRICT_MAPPING = {
@@ -27,26 +27,31 @@ STRICT_MAPPING = {
     "LUMINATOR_WHITE": "A_0344020A_1", "LUMINATOR BIANCO": "A_0344020A_1"
 }
 
-def clean_text(text):
+def super_clean(text):
+    """글자에서 공백, 괄호, 특수문자를 싹 제거하여 비교용 뼈대만 남김"""
     if not text or pd.isna(text): return ""
-    return str(text).upper().replace(" ", "").strip()
+    text = str(text).upper()
+    text = re.sub(r'\(.*?\)', '', text) # 괄호 내용 삭제
+    text = re.sub(r'[^A-Z0-9가-힣]', '', text) # 영문, 숫자, 한글 제외 모두 삭제
+    return text.strip()
 
 def transform_engine(order_file, code_ref, price_ref, temp_cols):
     results = []
     TODAY = datetime.now().strftime('%Y-%m-%d')
     
     master_by_code = {str(r['품목코드']).strip(): {"name": str(r['품목명']), "price": int(r['소비자가']) if pd.notna(r['소비자가']) else 0} for _, r in price_ref.iterrows()}
-    set_standard = [str(n).upper() for n in code_ref['상품명'].dropna().unique()]
+    
+    # 기준 데이터 전처리 (비교용)
+    code_ref['clean_name'] = code_ref['상품명'].apply(super_clean)
+    set_standard = code_ref[['상품명', 'clean_name']].dropna()
 
     xls = pd.ExcelFile(order_file)
     order_cnt = 1
 
-    # 1. 파일 안의 모든 시트를 순회 (필터링 없음)
     for sheet in xls.sheet_names:
         df_raw = pd.read_excel(order_file, sheet_name=sheet, header=None)
         if df_raw.empty: continue
 
-        # 2. 헤더(컬럼명) 위치 자동 찾기
         header_idx = 0
         for i, row in df_raw.iterrows():
             if any(k in str(s) for s in row.values for k in ["구매", "상품", "ITEM", "제품"]):
@@ -56,7 +61,6 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
         df = pd.read_excel(order_file, sheet_name=sheet, skiprows=header_idx)
         df.columns = [str(c).replace(" ", "").upper() for c in df.columns]
 
-        # 3. 필수 컬럼 매핑
         col_item = next((c for c in df.columns if any(k in c for k in ["상품", "구매제품", "모델", "ITEM"])), None)
         col_cust = next((c for c in df.columns if any(k in c for k in ["고객", "수령", "성함", "주문자"])), None)
         col_addr = next((c for c in df.columns if any(k in c for k in ["주소", "배송지"])), None)
@@ -65,43 +69,42 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
 
         if not col_item: continue
 
-        # 4. 행 데이터 처리
         for _, row in df.iterrows():
-            # 변수 초기화 (UnboundLocalError 방지)
             customer_name = "미기재"
             val_item = str(row.get(col_item, ""))
             
-            if val_item == "nan" or not val_item.strip() or "취소함" in val_item:
-                continue
-
-            # 고객명 추출
+            if val_item == "nan" or not val_item.strip(): continue
+            
             raw_cust = str(row.get(col_cust, '')).strip()
             if raw_cust != "nan" and raw_cust != "":
                 customer_name = f"{DEFAULT_INFO['prefix']}{re.sub(r'^(르위켄_|피쏘_|옐로우라이트_|까사디자인_)', '', raw_cust)}"
-
-            clean_name = clean_text(val_item)
-            if any(x in clean_name for x in ["시공비", "발송건", "배송비", "배송료"]): 
-                continue
+            
+            if "취소함" in val_item: continue
+            
+            # 비교용 클리닝
+            item_for_match = super_clean(val_item)
+            if any(x in item_for_match for x in ["시공비", "발송건", "배송비", "배송료"]): continue
 
             box_codes = []
             final_n = ""
 
-            # 5. 매칭 로직
+            # 1. 강제 매핑
             for kw, f_code in STRICT_MAPPING.items():
-                if kw.replace(" ","") in clean_name:
+                if super_clean(kw) in item_for_match:
                     box_codes = [f_code]
                     final_n = master_by_code.get(f_code, {}).get('name', val_item)
                     break
             
+            # 2. 고도화된 퍼지 매칭
             if not box_codes:
-                match = process.extractOne(val_item.upper(), set_standard, scorer=fuzz.token_set_ratio)
-                if match and match[1] > 60:
-                    final_n = match[0]
+                # 유사도 검사 (token_set_ratio 사용으로 단어 순서 바뀌어도 인식)
+                match = process.extractOne(item_for_match, set_standard['clean_name'], scorer=fuzz.token_set_ratio)
+                if match and match[1] > 75: 
+                    final_n = set_standard.iloc[match[2]]['상품명']
                     set_rows = code_ref[code_ref['상품명'] == final_n]
                     if not set_rows.empty:
-                        box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:] if pd.notna(v) and str(v).strip() != ""]
+                        box_codes = [str(v).strip() for v in set_rows.iloc[0, 1:6] if pd.notna(v) and str(v).strip() != ""]
 
-            # 6. 결과 리스트 적재
             if box_codes:
                 for code in box_codes:
                     it = master_by_code.get(code)
@@ -130,7 +133,7 @@ def transform_engine(order_file, code_ref, price_ref, temp_cols):
 
     return pd.DataFrame(results)
 
-# --- UI ---
+# --- UI (전체 코드) ---
 st.set_page_config(page_title="atempo 유통점 발주 ERP 변환 시스템", layout="wide")
 st.title("🤖 atempo 유통점 발주 ERP 변환 시스템")
 
@@ -143,15 +146,15 @@ if 'masters' not in st.session_state:
             st.session_state.masters = (code_ref, price_ref, temp_df)
             st.sidebar.success("✅ 기준 데이터 연결 완료")
     except Exception as e:
-        st.sidebar.error(f"❌ 드라이브 연결 실패")
+        st.sidebar.error("❌ 드라이브 연결 실패")
 
-uploaded_file = st.file_uploader("📥 엑셀 파일을 업로드하세요 (모든 시트를 읽습니다)", type="xlsx")
+uploaded_file = st.file_uploader("📥 파일을 업로드하세요", type="xlsx")
 
 if uploaded_file and st.button("🪄 ERP 양식으로 변환하기"):
     if 'masters' in st.session_state:
         m_code, m_price, m_temp = st.session_state.masters
         final_df = transform_engine(uploaded_file, m_code, m_price, m_temp.columns.tolist())
-        st.success(f"변환 완료! (총 {len(final_df)}행 추출)")
+        st.success(f"변환 완료! (총 {len(final_df)}행)")
         st.dataframe(final_df)
         
         output = io.BytesIO()
